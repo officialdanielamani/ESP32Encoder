@@ -1,11 +1,11 @@
 /*
- * ESP32Encoder.cpp
+ * ESP32Encoder.cpp  –  migrated to driver/pulse_cnt.h (IDF v5 / Arduino-ESP32 v3+)
  *
- *  Created on: Oct 15, 2018
- *      Author: hephaestus
+ * Replaces the deprecated driver/pcnt.h (legacy) API that produced:
+ *   warning: "legacy pcnt driver is deprecated, please migrate to use driver/pulse_cnt.h"
  */
 
-#include <ESP32Encoder.h>
+#include "ESP32Encoder.h"
 #ifdef ARDUINO
 #include <Arduino.h>
 #else
@@ -15,329 +15,209 @@
 
 #include <soc/soc_caps.h>
 #if SOC_PCNT_SUPPORTED
-// Not all esp32 chips support the pcnt (notably the esp32c3 does not)
-#include <soc/pcnt_struct.h>
+
 #include "esp_log.h"
-#include "esp_ipc.h"
-#if ( defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3) )
-	#include <freertos/FreeRTOS.h>
-	#include <rom/gpio.h>
-#endif
+static const char* TAG_ENCODER __attribute__((unused)) = "ESP32Encoder";
 
-static const char* TAG_ENCODER = "ESP32Encoder";
+// ── Static member definitions ─────────────────────────────────────────────────
+puType   ESP32Encoder::useInternalWeakPullResistors = puType::down;
+uint32_t ESP32Encoder::isrServiceCpuCore            = ISR_CORE_USE_DEFAULT;
+ESP32Encoder* ESP32Encoder::encoders[MAX_ESP32_ENCODERS] = {};
+bool ESP32Encoder::attachedInterrupt = false;
 
-static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
-#define _ENTER_CRITICAL() portENTER_CRITICAL_SAFE(&spinlock)
-#define _EXIT_CRITICAL() portEXIT_CRITICAL_SAFE(&spinlock)
-
-
-//static ESP32Encoder *gpio2enc[48];
-//
-//
-puType ESP32Encoder::useInternalWeakPullResistors = puType::down;
-uint32_t ESP32Encoder::isrServiceCpuCore = ISR_CORE_USE_DEFAULT;
-ESP32Encoder *ESP32Encoder::encoders[MAX_ESP32_ENCODERS] = { NULL, };
-
-bool ESP32Encoder::attachedInterrupt=false;
-
-ESP32Encoder::ESP32Encoder(bool always_interrupt_, enc_isr_cb_t enc_isr_cb, void* enc_isr_cb_data):
-	always_interrupt{always_interrupt_},
-	aPinNumber{(gpio_num_t) 0},
-	bPinNumber{(gpio_num_t) 0},
-	unit{(pcnt_unit_t) -1},
-	countsMode{2},
-	count{0},
-	r_enc_config{},
-	_enc_isr_cb(enc_isr_cb),
-	_enc_isr_cb_data(enc_isr_cb_data),
-	attached{false},
-	direction{false},
-	working{false}
+// ── Watch-point callback – fires when accumulator overflows the HW limit ──────
+static bool IRAM_ATTR pcnt_on_reach(pcnt_unit_handle_t unit,
+                                    const pcnt_watch_event_data_t* edata,
+                                    void* user_ctx)
 {
-	if (enc_isr_cb_data == nullptr)
-	{
-		_enc_isr_cb_data = this;
-	}
+    ESP32Encoder* enc = static_cast<ESP32Encoder*>(user_ctx);
+    // edata->watch_point_val is the limit that was hit (+_INT16_MAX or _INT16_MIN)
+    enc->count += edata->watch_point_value;
+    pcnt_unit_clear_count(unit);
+
+    if (enc->always_interrupt && enc->_enc_isr_cb) {
+        enc->_enc_isr_cb(enc->_enc_isr_cb_data);
+    }
+    return false; // no task wakeup needed
 }
 
-ESP32Encoder::~ESP32Encoder() {}
+// ── Constructor / Destructor ──────────────────────────────────────────────────
+ESP32Encoder::ESP32Encoder(bool always_interrupt_, enc_isr_cb_t cb, void* cb_data)
+    : always_interrupt(always_interrupt_),
+      aPinNumber((gpio_num_t)0),
+      bPinNumber((gpio_num_t)0),
+      _enc_isr_cb(cb),
+      _enc_isr_cb_data(cb_data ? cb_data : this),
+      count(0),
+      attached(false),
+      unitIndex(-1)
+{}
 
-/* Decode what PCNT's unit originated an interrupt
- * and pass this information together with the event type
- * the main program using a queue.
- */
-#ifdef CONFIG_IDF_TARGET_ESP32S2
-	#define COUNTER_H_LIM cnt_thr_h_lim_lat_un
-	#define COUNTER_L_LIM cnt_thr_l_lim_lat_un
-	#define thres0_lat cnt_thr_thres0_lat_un
-	#define thres1_lat cnt_thr_thres1_lat_un
-
-#elif CONFIG_IDF_TARGET_ESP32S3
-	#define COUNTER_H_LIM cnt_thr_h_lim_lat_un
-	#define COUNTER_L_LIM cnt_thr_l_lim_lat_un
-	#define thres0_lat cnt_thr_thres0_lat_un
-	#define thres1_lat cnt_thr_thres1_lat_un
-
-#elif CONFIG_IDF_TARGET_ESP32C6
-	#define COUNTER_H_LIM cnt_thr_h_lim_lat
-	#define COUNTER_L_LIM cnt_thr_l_lim_lat
-	#define thres0_lat cnt_thr_thres0_lat
-	#define thres1_lat cnt_thr_thres1_lat
-#else
-	#define COUNTER_H_LIM h_lim_lat
-	#define COUNTER_L_LIM l_lim_lat
-#endif
-
-
-
-static void esp32encoder_pcnt_intr_handler(void *arg) {
-	ESP32Encoder * esp32enc = static_cast<ESP32Encoder *>(arg);
-	pcnt_unit_t unit = esp32enc->r_enc_config.unit;
-	_ENTER_CRITICAL();
-	if(PCNT.status_unit[unit].COUNTER_H_LIM){
-		esp32enc->count = esp32enc->count + esp32enc->r_enc_config.counter_h_lim;
-		pcnt_counter_clear(unit);
-	} else if(PCNT.status_unit[unit].COUNTER_L_LIM){
-		esp32enc->count = esp32enc->count + esp32enc->r_enc_config.counter_l_lim;
-		pcnt_counter_clear(unit);
-	} else if(esp32enc->always_interrupt && (PCNT.status_unit[unit].thres0_lat || PCNT.status_unit[unit].thres1_lat)) {
-		int16_t c;
-		pcnt_get_counter_value(unit, &c);
-		esp32enc->count = esp32enc->count + c;
-		pcnt_set_event_value(unit, PCNT_EVT_THRES_0, -1);
-		pcnt_set_event_value(unit, PCNT_EVT_THRES_1, 1);
-		pcnt_event_enable(unit, PCNT_EVT_THRES_0);
-		pcnt_event_enable(unit, PCNT_EVT_THRES_1);
-		pcnt_counter_clear(unit);
-		if (esp32enc->_enc_isr_cb) {
-			esp32enc->_enc_isr_cb(esp32enc->_enc_isr_cb_data);
-		}
-	}
-	_EXIT_CRITICAL();
+ESP32Encoder::~ESP32Encoder() {
+    if (attached) detach();
 }
 
-
-
-
-
-void ESP32Encoder::detach(){
-	pcnt_counter_pause(unit);
-	pcnt_isr_handler_remove(this->r_enc_config.unit);
-	ESP32Encoder::encoders[unit]=NULL;
-	attached = false;
+// ── detach ────────────────────────────────────────────────────────────────────
+void ESP32Encoder::detach() {
+    if (!attached) return;
+    pcnt_unit_stop(pcnt_unit);
+    pcnt_unit_disable(pcnt_unit);
+    pcnt_del_channel(pcnt_chanA);
+    if (pcnt_chanB) pcnt_del_channel(pcnt_chanB);
+    pcnt_del_unit(pcnt_unit);
+    pcnt_unit  = nullptr;
+    pcnt_chanA = nullptr;
+    pcnt_chanB = nullptr;
+    if (unitIndex >= 0) {
+        encoders[unitIndex] = nullptr;
+        unitIndex = -1;
+    }
+    attached = false;
 }
 
-void ESP32Encoder::detatch(){
-	this->detach();
-}
+void ESP32Encoder::detatch() { detach(); }
 
-static IRAM_ATTR void ipc_install_isr_on_core(void *arg) {
-    esp_err_t *result = (esp_err_t*) arg;
-    *result = pcnt_isr_service_install(0);
-}
-
+// ── Internal attach ───────────────────────────────────────────────────────────
 void ESP32Encoder::attach(int a, int b, encType et) {
-	if (attached) {
-		ESP_LOGE(TAG_ENCODER, "attach: already attached");
-		return;
-	}
-	int index = 0;
-	for (; index < MAX_ESP32_ENCODERS; index++) {
-		if (ESP32Encoder::encoders[index] == NULL) {
-			encoders[index] = this;
-			break;
-		}
-	}
-	if (index == MAX_ESP32_ENCODERS) {
-		while(1){
-			ESP_LOGE(TAG_ENCODER, "Too many encoders, FAIL!");
-			delay(100);
-		}
-		
-	}
+    if (attached) {
+        ESP_LOGE(TAG_ENCODER, "attach: already attached");
+        return;
+    }
 
-	// Set data now that pin attach checks are done
-	unit = (pcnt_unit_t) index;
-	this->aPinNumber = (gpio_num_t) a;
-	this->bPinNumber = (gpio_num_t) b;
+    // Find a free slot
+    int index = -1;
+    for (int i = 0; i < MAX_ESP32_ENCODERS; i++) {
+        if (encoders[i] == nullptr) { index = i; break; }
+    }
+    if (index < 0) {
+        ESP_LOGE(TAG_ENCODER, "Too many encoders!");
+        return;
+    }
+    unitIndex       = index;
+    encoders[index] = this;
+    aPinNumber = (gpio_num_t)a;
+    bPinNumber = (gpio_num_t)b;
 
-	//Set up the IO state of hte pin
-	gpio_pad_select_gpio(aPinNumber);
-	gpio_pad_select_gpio(bPinNumber);
-	gpio_set_direction(aPinNumber, GPIO_MODE_INPUT);
-	gpio_set_direction(bPinNumber, GPIO_MODE_INPUT);
-	if(useInternalWeakPullResistors == puType::down){
-		gpio_pulldown_en(aPinNumber);
-		gpio_pulldown_en(bPinNumber);
-	}
-	if(useInternalWeakPullResistors == puType::up){
-		gpio_pullup_en(aPinNumber);
-		gpio_pullup_en(bPinNumber);
-	}
-	// Set up encoder PCNT configuration
-	// Configure channel 0
-	r_enc_config.pulse_gpio_num = aPinNumber; //Rotary Encoder Chan A
-	r_enc_config.ctrl_gpio_num = bPinNumber;    //Rotary Encoder Chan B
+    // ── Configure GPIO pull resistors ─────────────────────────────────────────
+    gpio_set_direction(aPinNumber, GPIO_MODE_INPUT);
+    gpio_set_direction(bPinNumber, GPIO_MODE_INPUT);
+    if (useInternalWeakPullResistors == puType::down) {
+        gpio_pulldown_en(aPinNumber);
+        gpio_pulldown_en(bPinNumber);
+    } else if (useInternalWeakPullResistors == puType::up) {
+        gpio_pullup_en(aPinNumber);
+        gpio_pullup_en(bPinNumber);
+    }
 
-	r_enc_config.unit = unit;
-	r_enc_config.channel = PCNT_CHANNEL_0;
+    // ── Create PCNT unit ──────────────────────────────────────────────────────
+    pcnt_unit_config_t unit_cfg = {};
+    unit_cfg.high_limit = _INT16_MAX;
+    unit_cfg.low_limit  = _INT16_MIN;
+    unit_cfg.flags.accum_count = 1;   // enable HW accumulation on overflow
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &pcnt_unit));
 
-	r_enc_config.pos_mode = et != encType::single ? PCNT_COUNT_DEC : PCNT_COUNT_DIS; //Count Only On Rising-Edges
-	r_enc_config.neg_mode = PCNT_COUNT_INC;   // Discard Falling-Edge
+    // ── Glitch filter ─────────────────────────────────────────────────────────
+    if (filterNs > 0) {
+        pcnt_glitch_filter_config_t filter_cfg = {};
+        filter_cfg.max_glitch_ns = filterNs;
+        ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_unit, &filter_cfg));
+    }
 
-	r_enc_config.lctrl_mode = PCNT_MODE_KEEP;    // Rising A on HIGH B = CW Step
-	r_enc_config.hctrl_mode = PCNT_MODE_REVERSE; // Rising A on LOW B = CCW Step
+    // ── Channel A: signal=A, control=B ───────────────────────────────────────
+    pcnt_chan_config_t chanA_cfg = {};
+    chanA_cfg.edge_gpio_num = a;
+    chanA_cfg.level_gpio_num = b;
+    ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chanA_cfg, &pcnt_chanA));
 
-	r_enc_config		.counter_h_lim = _INT16_MAX;
-	r_enc_config		.counter_l_lim = _INT16_MIN ;
+    // Rising edge on A:  B low  → count up,  B high → count down
+    // Falling edge on A: B low  → count down (half/full), B high → count up
+    pcnt_channel_set_edge_action(pcnt_chanA,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE,  // rising  edge
+        et != encType::single ? PCNT_CHANNEL_EDGE_ACTION_DECREASE
+                              : PCNT_CHANNEL_EDGE_ACTION_HOLD);
+    pcnt_channel_set_level_action(pcnt_chanA,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,     // level low  → keep direction
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE); // level high → invert
 
-	pcnt_unit_config(&r_enc_config);
+    // ── Channel B: signal=B, control=A (full-quad only) ──────────────────────
+    if (et == encType::full) {
+        pcnt_chan_config_t chanB_cfg = {};
+        chanB_cfg.edge_gpio_num  = b;
+        chanB_cfg.level_gpio_num = a;
+        ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chanB_cfg, &pcnt_chanB));
 
-	// Configure channel 0
-	r_enc_config.pulse_gpio_num = bPinNumber; //make prior control into signal
-	r_enc_config.ctrl_gpio_num = aPinNumber;    //and prior signal into control
+        pcnt_channel_set_edge_action(pcnt_chanB,
+            PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+            PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+        pcnt_channel_set_level_action(pcnt_chanB,
+            PCNT_CHANNEL_LEVEL_ACTION_INVERSE,
+            PCNT_CHANNEL_LEVEL_ACTION_KEEP);
+    }
 
-	r_enc_config.channel = PCNT_CHANNEL_1; // channel 1
+    // ── Watch points (overflow/underflow) + callback ─────────────────────────
+    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, _INT16_MAX));
+    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, _INT16_MIN));
 
-	r_enc_config.pos_mode = PCNT_COUNT_DIS; //disabling channel 1
-	r_enc_config.neg_mode = PCNT_COUNT_DIS;   // disabling channel 1
+    pcnt_event_callbacks_t cbs = {};
+    cbs.on_reach = pcnt_on_reach;
+    ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(pcnt_unit, &cbs, this));
 
-	r_enc_config.lctrl_mode = PCNT_MODE_DISABLE;    // disabling channel 1
-	r_enc_config.hctrl_mode = PCNT_MODE_DISABLE; // disabling channel 1
+    // ── Enable and start ──────────────────────────────────────────────────────
+    ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 
-	if (et == encType::full) {
-		// set up second channel for full quad
-
-		r_enc_config.pos_mode = PCNT_COUNT_DEC; //Count Only On Rising-Edges
-		r_enc_config.neg_mode = PCNT_COUNT_INC;   // Discard Falling-Edge
-
-		r_enc_config.lctrl_mode = PCNT_MODE_REVERSE;    // prior high mode is now low
-		r_enc_config.hctrl_mode = PCNT_MODE_KEEP; // prior low mode is now high
-	}
-	pcnt_unit_config(&r_enc_config);
-
-	// Filter out bounces and noise
-	setFilter(250); // Filter Runt Pulses
-
-	/* Enable events on maximum and minimum limit values */
-	pcnt_event_enable(unit, PCNT_EVT_H_LIM);
-	pcnt_event_enable(unit, PCNT_EVT_L_LIM);
-	pcnt_counter_pause(unit); // Initial PCNT init
-	/* Register ISR service and enable interrupts for PCNT unit */
-	if(! attachedInterrupt){
-#if ( defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C6) ) // esp32-s2 and -c6 are single core, no ipc call
-			esp_err_t er = pcnt_isr_service_install(0);
-			if (er != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "Encoder install isr service failed");
-			}
-#else
-		if (isrServiceCpuCore == ISR_CORE_USE_DEFAULT || isrServiceCpuCore == xPortGetCoreID()) {
-			esp_err_t er = pcnt_isr_service_install(0);
-			if (er != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "Encoder install isr service on same core failed");
-			}
-		} else {
-			esp_err_t ipc_ret_code = ESP_FAIL;
-			esp_err_t er = esp_ipc_call_blocking(isrServiceCpuCore, ipc_install_isr_on_core, &ipc_ret_code);
-			if (er != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "IPC call to install isr service on core %ud failed", isrServiceCpuCore);
-			}
-			if (ipc_ret_code != ESP_OK){
-				ESP_LOGE(TAG_ENCODER, "Encoder install isr service on core %ud failed", isrServiceCpuCore);
-			}
-		}
-#endif
-
-		attachedInterrupt=true;
-	}
-
-	// Add ISR handler for this unit
-	if (pcnt_isr_handler_add(unit, esp32encoder_pcnt_intr_handler, this) != ESP_OK) {
-		ESP_LOGE(TAG_ENCODER, "Encoder install interrupt handler for unit %d failed", unit);
-	}
-
-	if (always_interrupt){
-		pcnt_set_event_value(unit, PCNT_EVT_THRES_0, -1);
-		pcnt_set_event_value(unit, PCNT_EVT_THRES_1, 1);
-		pcnt_event_enable(unit, PCNT_EVT_THRES_0);
-		pcnt_event_enable(unit, PCNT_EVT_THRES_1);
-	}
-	pcnt_counter_clear(unit);
-	pcnt_intr_enable(unit);
-	pcnt_counter_resume(unit);
-
-	attached = true;
-
+    attached = true;
 }
 
-void ESP32Encoder::attachHalfQuad(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, encType::half);
+// ── Public attach helpers ─────────────────────────────────────────────────────
+void ESP32Encoder::attachHalfQuad   (int a, int b) { attach(a, b, encType::half);   }
+void ESP32Encoder::attachSingleEdge (int a, int b) { attach(a, b, encType::single); }
+void ESP32Encoder::attachFullQuad   (int a, int b) { attach(a, b, encType::full);   }
 
-}
-void ESP32Encoder::attachSingleEdge(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, encType::single);
-}
-void ESP32Encoder::attachFullQuad(int aPintNumber, int bPinNumber) {
-	attach(aPintNumber, bPinNumber, encType::full);
+// ── Count operations ──────────────────────────────────────────────────────────
+int64_t ESP32Encoder::getCount() {
+    int raw = 0;
+    pcnt_unit_get_count(pcnt_unit, &raw);
+    return count + raw;
 }
 
 void ESP32Encoder::setCount(int64_t value) {
-	_ENTER_CRITICAL();
-	count = value - getCountRaw();
-	_EXIT_CRITICAL();
-}
-
-int64_t ESP32Encoder::getCountRaw() {
-	int16_t c;
-	int64_t compensate = 0;
-	_ENTER_CRITICAL();
-	pcnt_get_counter_value(unit, &c);
-	// check if counter overflowed, if so re-read and compensate
-	// see https://github.com/espressif/esp-idf/blob/v4.4.1/tools/unit-test-app/components/test_utils/ref_clock_impl_rmt_pcnt.c#L168-L172
-	if (PCNT.int_st.val & BIT(unit)) {
-        pcnt_get_counter_value(unit, &c);
-		if(PCNT.status_unit[unit].COUNTER_H_LIM){
-			compensate = r_enc_config.counter_h_lim;
-		} else if (PCNT.status_unit[unit].COUNTER_L_LIM) {
-			compensate = r_enc_config.counter_l_lim;
-		}
-	}
-	_EXIT_CRITICAL();
-	return compensate + c;
-}
-
-int64_t ESP32Encoder::getCount() {
-	_ENTER_CRITICAL();
-	int64_t result = count + getCountRaw();
-	_EXIT_CRITICAL();
-	return result;
+    int raw = 0;
+    pcnt_unit_get_count(pcnt_unit, &raw);
+    count = value - raw;
 }
 
 int64_t ESP32Encoder::clearCount() {
-	_ENTER_CRITICAL();
-	count = 0;
-	_EXIT_CRITICAL();
-	return pcnt_counter_clear(unit);
+    count = 0;
+    pcnt_unit_clear_count(pcnt_unit);
+    return 0;
 }
 
 int64_t ESP32Encoder::pauseCount() {
-	return pcnt_counter_pause(unit);
+    pcnt_unit_stop(pcnt_unit);
+    return getCount();
 }
 
 int64_t ESP32Encoder::resumeCount() {
-	return pcnt_counter_resume(unit);
+    pcnt_unit_start(pcnt_unit);
+    return getCount();
 }
 
-void ESP32Encoder::setFilter(uint16_t value) {
-	if(value>1023)value=1023;
-	if(value==0) {
-		pcnt_filter_disable(unit);
-	} else {
-		pcnt_set_filter_value(unit, value);
-		pcnt_filter_enable(unit);
-	}
-
+// ── Glitch filter (ns) ────────────────────────────────────────────────────────
+// Must be called before attach(); if called after, it re-applies the filter.
+void ESP32Encoder::setFilter(uint16_t value_ns) {
+    filterNs = value_ns;
+    if (!attached || !pcnt_unit) return;
+    if (value_ns == 0) {
+        pcnt_unit_set_glitch_filter(pcnt_unit, nullptr);
+    } else {
+        pcnt_glitch_filter_config_t f = {};
+        f.max_glitch_ns = value_ns;
+        pcnt_unit_set_glitch_filter(pcnt_unit, &f);
+    }
 }
+
 #else
-#warning PCNT not supported on this SoC, this will likely lead to linker errors when using ESP32Encoder
+#warning PCNT not supported on this SoC
 #endif // SOC_PCNT_SUPPORTED
